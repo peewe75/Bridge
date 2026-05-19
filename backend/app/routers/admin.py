@@ -53,19 +53,9 @@ from app.services.invoicing import (
 from app.services.licenses import admin_summary, create_license
 from app.services.licenses import apply_license_replacement, set_license_grace_window
 from app.services.download_access import get_client_download_policy, normalize_download_policy, resolve_allowed_download_codes
+from app.services.system_control import SYSTEM_CONTROL_STATE, snapshot as _system_snapshot
 
 router = APIRouter(prefix="/admin", tags=["admin"])
-
-SYSTEM_CONTROL_STATE: dict[str, object] = {
-    "mode": "NORMAL",  # NORMAL | MAINTENANCE | FROZEN | SHUTDOWN
-    "billing_enabled": True,
-    "signals_enabled": True,
-    "ea_bridge_enabled": True,
-    "client_access_enabled": True,
-    "updated_at": None,
-    "last_action": None,
-    "last_reason": None,
-}
 
 
 class AdminInvoiceIssueRequest(BaseModel):
@@ -196,16 +186,7 @@ def _invoice_with_client(db: Session, invoice: Invoice) -> dict:
 
 
 def _snapshot_system_state() -> dict:
-    return {
-        "mode": SYSTEM_CONTROL_STATE.get("mode", "NORMAL"),
-        "billing_enabled": bool(SYSTEM_CONTROL_STATE.get("billing_enabled", True)),
-        "signals_enabled": bool(SYSTEM_CONTROL_STATE.get("signals_enabled", True)),
-        "ea_bridge_enabled": bool(SYSTEM_CONTROL_STATE.get("ea_bridge_enabled", True)),
-        "client_access_enabled": bool(SYSTEM_CONTROL_STATE.get("client_access_enabled", True)),
-        "updated_at": SYSTEM_CONTROL_STATE.get("updated_at"),
-        "last_action": SYSTEM_CONTROL_STATE.get("last_action"),
-        "last_reason": SYSTEM_CONTROL_STATE.get("last_reason"),
-    }
+    return _system_snapshot()
 
 
 def _get_or_create_fee_rules(db: Session, user_id: str | None = None) -> SuperAdminFeeRule:

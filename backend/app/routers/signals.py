@@ -22,6 +22,7 @@ from app.schemas import (
 )
 from app.services.bridge_files import enqueue_command
 from app.services.signal_parser import canonical_to_bridge_payload, parse_signal
+from app.services.system_control import ea_bridge_enabled, signals_enabled
 
 router = APIRouter(prefix="/signals", tags=["signals"])
 
@@ -163,6 +164,9 @@ def signal_ingest(req: SignalIngestRequest, user: User = Depends(require_roles("
     should_enqueue = out.matched and out.confidence >= req.auto_enqueue_threshold
     if req.require_valid_logic and not out.validation.get("valid_logic"):
         should_enqueue = False
+    if should_enqueue and not (signals_enabled() and ea_bridge_enabled()):
+        should_enqueue = False
+        out.warnings.append("system_control_blocked")
     if should_enqueue:
         payload = canonical_to_bridge_payload(out.canonical, source_chat_id=req.source_chat_id)
         enqueue_info = enqueue_command(payload, write_mt4=req.write_mt4, write_mt5=req.write_mt5)

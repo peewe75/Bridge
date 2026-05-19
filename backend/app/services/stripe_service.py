@@ -93,7 +93,11 @@ def create_invoice_payment_session(
 
 def construct_webhook_event(payload: bytes, sig_header: str | None):
     settings = get_settings()
+    is_dev = (settings.app_env or "").lower() in {"development", "dev", "local"}
     if not settings.stripe_secret_key:
+        if not is_dev:
+            # C3: fail-closed in produzione. Senza key non possiamo verificare la firma.
+            raise ValueError("STRIPE_SECRET_KEY missing in non-dev env: webhook closed")
         data = json.loads(payload.decode("utf-8"))
         return data
     stripe.api_key = settings.stripe_secret_key

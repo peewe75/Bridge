@@ -10,9 +10,15 @@ from app.config import get_settings
 from app.db import SessionLocal
 from app.models import AuditLog, Client, License, SignalFormat, SignalParseLog, SignalRoom
 from app.services.bridge_files import enqueue_command
+from app.services.ea_security import verify_ea_signature
 from app.services.licenses import hash_activation_code, is_license_runtime_valid, normalize_license_status
 from app.services.signal_parser import canonical_to_bridge_payload, parse_signal
+from app.services.system_control import ea_bridge_enabled, signals_enabled
 from app.services.telegram_service import get_me, get_webhook_info, send_message
+
+
+def _is_dev_env() -> bool:
+    return get_settings().app_env.lower() in {"development", "dev", "local"}
 
 router = APIRouter(prefix="/telegram", tags=["telegram"])
 
@@ -66,12 +72,16 @@ def _try_activate_license(db: Session, chat_id_s: str, chat_id: int | str, text:
     if len(activation_code) < 6 or not any(c.isalnum() for c in activation_code):
         return None
 
-    license_row = (
+    # Row lock per evitare double-spend del codice (no-op su SQLite)
+    license_q = (
         db.query(License)
         .filter(License.activation_code_hash == hash_activation_code(activation_code))
         .order_by(License.created_at.desc())
-        .first()
     )
+    try:
+        license_row = license_q.with_for_update().first()
+    except Exception:
+        license_row = license_q.first()
 
     if not license_row:
         # Non è un codice licenza valido → non interferire con altri handler
@@ -89,7 +99,9 @@ def _try_activate_license(db: Session, chat_id_s: str, chat_id: int | str, text:
         )
         return {"ok": True, "action": "ACTIVATE_EXPIRED"}
 
+    # Re-check sotto lock: se altra richiesta ha già usato il codice, abort
     if license_row.activation_code_used_at:
+        db.commit()
         _AWAITING_LICENSE.discard(chat_id_s)
         send_message(
             chat_id,
@@ -216,9 +228,14 @@ async def telegram_webhook(
     x_telegram_bot_api_secret_token: str | None = Header(default=None, alias="X-Telegram-Bot-Api-Secret-Token"),
 ):
     settings = get_settings()
-    if settings.telegram_webhook_secret:
-        if x_telegram_bot_api_secret_token != settings.telegram_webhook_secret:
-            raise HTTPException(status_code=403, detail="Telegram webhook secret non valido")
+    if not settings.telegram_webhook_secret:
+        if not _is_dev_env():
+            raise HTTPException(
+                status_code=500,
+                detail="TELEGRAM_WEBHOOK_SECRET non configurato: webhook chiuso in produzione",
+            )
+    elif x_telegram_bot_api_secret_token != settings.telegram_webhook_secret:
+        raise HTTPException(status_code=403, detail="Telegram webhook secret non valido")
 
     payload = await request.json()
     chat_id = None
@@ -286,6 +303,9 @@ async def telegram_webhook(
         # CASO 2: Messaggio da canale/gruppo — parsing segnali
         # (il bot è admin del canale, legge silenziosa)
         # ─────────────────────────────────────────────────────
+        # H1: rispetta system control. Se segnali disabilitati (MAINTENANCE/FROZEN/SHUTDOWN),
+        # salta enqueue ma non blocca audit del messaggio.
+        signals_active = signals_enabled() and ea_bridge_enabled()
         if chat_id_s and text and chat_type in ("group", "supergroup", "channel"):
             rooms = (
                 db.query(SignalRoom)
@@ -315,12 +335,13 @@ async def telegram_webhook(
                 should_enqueue = parsed.matched and parsed.confidence >= threshold
                 if require_valid_logic and not parsed.validation.get("valid_logic"):
                     should_enqueue = False
+                if should_enqueue and not signals_active:
+                    should_enqueue = False
+                    parsed.warnings.append("system_control_blocked")
                 enqueue_meta = None
+                bridge_payload = None
                 if should_enqueue:
-                    bridge_payload = canonical_to_bridge_payload(parsed.canonical, source_chat_id=chat_id_s)
-                    enqueue_meta = enqueue_command(bridge_payload, write_mt4=write_mt4, write_mt5=write_mt5)
-
-                    # ── Notifiche a TUTTI i client collegati a questa signal room ──
+                    # ── Client della room (con telegram per notifica) ──
                     clients_in_room = (
                         db.query(Client)
                         .filter(Client.signal_room_id == room.id)
@@ -333,7 +354,31 @@ async def telegram_webhook(
                         if single_client:
                             clients_in_room = [single_client]
 
+                    # H11: enqueue solo se almeno un client ha licenza runtime-valid
+                    now_dt = datetime.now(timezone.utc)
+                    valid_clients: list[Client] = []
                     for cl in clients_in_room:
+                        lic = (
+                            db.query(License)
+                            .filter(License.client_id == cl.id)
+                            .order_by(License.created_at.desc())
+                            .first()
+                        )
+                        if not lic:
+                            continue
+                        ok, _ = is_license_runtime_valid(lic, now=now_dt)
+                        if ok:
+                            valid_clients.append(cl)
+
+                    if not valid_clients:
+                        should_enqueue = False
+                        parsed.warnings.append("no_valid_license_in_room")
+
+                if should_enqueue:
+                    bridge_payload = canonical_to_bridge_payload(parsed.canonical, source_chat_id=chat_id_s)
+                    enqueue_meta = enqueue_command(bridge_payload, write_mt4=write_mt4, write_mt5=write_mt5)
+
+                    for cl in valid_clients:
                         _send_order_notification(cl, parsed.canonical, event_type="OPENED")
 
                     db.add(AuditLog(
@@ -348,7 +393,7 @@ async def telegram_webhook(
                             "confidence": parsed.confidence,
                             "parser_used": parsed.parser_used,
                             "payload": bridge_payload,
-                            "notified_clients": len(clients_in_room),
+                            "notified_clients": len(valid_clients),
                         },
                         created_at=datetime.now(timezone.utc),
                     ))
@@ -391,12 +436,39 @@ async def telegram_webhook(
 @router.post("/notify/trade-event")
 async def notify_trade_event(request: Request):
     """
-    Endpoint chiamato dall'EA (o da un monitor) per notificare eventi sul trade:
+    Endpoint chiamato dall'EA per notificare eventi sul trade:
     SL preso, TP1, TP2 raggiunti, posizione chiusa.
-    Payload atteso: { client_id, event_type, symbol, side, price, pnl, ticket }
+    Richiede firma HMAC EA (stessa di /ea/validate).
+    Payload atteso: {
+        license_id, install_id, account_number, platform, timestamp, signature,  # auth EA
+        event_type, symbol, side, price, pnl, ticket,                            # evento
+    }
     """
     payload = await request.json()
-    client_id = payload.get("client_id")
+
+    # C1: verifica firma EA prima di qualsiasi azione
+    license_id = payload.get("license_id")
+    install_id = payload.get("install_id")
+    account_number = payload.get("account_number")
+    platform = payload.get("platform")
+    timestamp = payload.get("timestamp")
+    signature = payload.get("signature")
+    if not all([license_id, install_id, account_number, platform, timestamp, signature]):
+        raise HTTPException(status_code=401, detail="Firma EA mancante")
+    try:
+        ts_int = int(timestamp)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Timestamp non valido")
+    if not verify_ea_signature(
+        license_id=license_id,
+        install_id=install_id,
+        account_number=str(account_number),
+        platform=str(platform),
+        timestamp=ts_int,
+        signature=str(signature),
+    ):
+        raise HTTPException(status_code=403, detail="Firma EA non valida")
+
     event_type = (payload.get("event_type") or "").upper()  # SL_HIT | TP1_HIT | TP2_HIT | CLOSED
     symbol = payload.get("symbol", "?")
     side = payload.get("side", "")
@@ -404,14 +476,19 @@ async def notify_trade_event(request: Request):
     pnl = payload.get("pnl")
     ticket = payload.get("ticket")
 
-    if not client_id or not event_type:
-        raise HTTPException(status_code=400, detail="client_id e event_type richiesti")
+    if not event_type:
+        raise HTTPException(status_code=400, detail="event_type richiesto")
 
     db: Session = SessionLocal()
     try:
-        client = db.query(Client).filter(Client.id == client_id).first()
+        # Risolvi client tramite licenza autenticata, non da client_id arbitrario
+        lic = db.query(License).filter(License.id == license_id).first()
+        if not lic or not lic.client_id:
+            return {"ok": False, "reason": "licenza non trovata o senza client"}
+        client = db.query(Client).filter(Client.id == lic.client_id).first()
         if not client or not client.telegram_chat_id:
             return {"ok": False, "reason": "cliente non trovato o Telegram non collegato"}
+        client_id = client.id
 
         pnl_str = ""
         if pnl is not None:

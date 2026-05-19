@@ -23,6 +23,12 @@ from app.services.bridge_files import (
     read_recent_results,
     write_result_file,
 )
+from app.services.system_control import ea_bridge_enabled
+
+
+def _require_bridge_enabled() -> None:
+    if not ea_bridge_enabled():
+        raise HTTPException(status_code=503, detail="EA bridge disabilitato (system control)")
 
 router = APIRouter(prefix="/bridge", tags=["bridge"])
 
@@ -128,6 +134,7 @@ def bridge_enqueue(
     _user=Depends(require_roles("SUPER_ADMIN", "ADMIN_WL")),
     db: Session = Depends(get_db),
 ):
+    _require_bridge_enabled()
     payload: dict[str, Any] = {
         "id": datetime.utcnow().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
         "ts": int(time.time()),
@@ -187,6 +194,7 @@ def bridge_control(
     user=Depends(require_roles("SUPER_ADMIN", "ADMIN_WL", "CLIENT")),
     db: Session = Depends(get_db),
 ):
+    _require_bridge_enabled()
     action = req.action.upper()
     side_filter = None
     if action.endswith("_BUY"):
