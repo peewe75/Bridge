@@ -136,20 +136,24 @@ def resolve_bridge_paths() -> SoftiBridgeFilePaths:
     return SoftiBridgeFilePaths(base, inbox, outbox, state, queue_mt4, queue_mt5, events)
 
 
-def enqueue_command(payload: dict[str, Any], *, write_mt4: bool = True, write_mt5: bool = True) -> dict[str, str]:
+def enqueue_command(payload: dict[str, Any], *, write_mt4: bool = True, write_mt5: bool = True) -> dict[str, Any]:
     # Ensure id and ts are always present — the EA skips lines without a valid id
     payload = dict(payload)
     if not payload.get("id"):
         payload["id"] = f"SIG-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
     if not payload.get("ts"):
         payload["ts"] = int(time.time())
-    paths = resolve_bridge_paths()
     line = format_cmd_line(payload)
+    # In multi-tenant prod il file è scritto dal sidecar sul VPS client. Il backend
+    # scrive il file solo se SOFTIBRIDGE_BRIDGE_FILE_LEGACY=true (dev/single-tenant).
+    if not get_settings().softibridge_bridge_file_legacy:
+        return {"line": line, "queue_mt4": None, "queue_mt5": None, "file_legacy": False}
+    paths = resolve_bridge_paths()
     if write_mt4:
         safe_write_queue_replace0(paths.queue_mt4, line)
     if write_mt5:
         safe_write_queue_replace0(paths.queue_mt5, line)
-    return {"line": line, "queue_mt4": str(paths.queue_mt4), "queue_mt5": str(paths.queue_mt5)}
+    return {"line": line, "queue_mt4": str(paths.queue_mt4), "queue_mt5": str(paths.queue_mt5), "file_legacy": True}
 
 
 def enqueue_control_command(

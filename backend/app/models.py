@@ -232,6 +232,9 @@ class SignalRoom(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True)
     owner_user_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("users.id"), nullable=True, index=True)
     client_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("clients.id"), nullable=True, index=True)
+    # BYO bot: opzionale; se settato, la room è alimentata da quel bot (modello B).
+    # Se NULL la room è alimentata dal bot globale di piattaforma (modello C).
+    telegram_bot_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("telegram_bots.id"), nullable=True, index=True)
     name: Mapped[str] = mapped_column(String)
     source_type: Mapped[str] = mapped_column(String, default="TELEGRAM")
     source_chat_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
@@ -455,6 +458,23 @@ class SuperAdminPayout(Base):
     status: Mapped[str] = mapped_column(String, default="PENDING", index=True)  # PENDING / PAID / ON_HOLD
     meta_json: Mapped[dict] = mapped_column("metadata", JSON_COMPAT, default=dict)
     paid_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class TelegramBot(Base):
+    __tablename__ = "telegram_bots"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    owner_type: Mapped[str] = mapped_column(String, default="CLIENT", index=True)  # PLATFORM | ADMIN_WL | CLIENT
+    owner_ref_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
+    bot_username: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
+    bot_token_enc: Mapped[str] = mapped_column(Text)  # Fernet-encrypted token
+    webhook_secret: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    webhook_url: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String, default="ACTIVE", index=True)  # ACTIVE/SUSPENDED/REVOKED
+    last_check_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

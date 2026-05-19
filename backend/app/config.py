@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     telegram_admin_super_chat_id: str = Field(default="", alias="TELEGRAM_ADMIN_SUPER_CHAT_ID")
     telegram_admin_alerts_chat_id: str = Field(default="", alias="TELEGRAM_ADMIN_ALERTS_CHAT_ID")
     telegram_support_chat_id: str = Field(default="", alias="TELEGRAM_SUPPORT_CHAT_ID")
+    # BYO bot — base URL pubblico per setWebhook dei bot client (es. https://api.softibridge.com)
+    telegram_webhook_base_url: str = Field(default="", alias="TELEGRAM_WEBHOOK_BASE_URL")
+    # Fernet 32-byte url-safe base64 key per cifrare i token bot dei client a riposo
+    telegram_token_enc_key: str = Field(default="", alias="TELEGRAM_TOKEN_ENC_KEY")
 
     stripe_secret_key: str = Field(default="", alias="STRIPE_SECRET_KEY")
     stripe_webhook_secret: str = Field(default="", alias="STRIPE_WEBHOOK_SECRET")
@@ -49,6 +53,9 @@ class Settings(BaseSettings):
     invoice_output_dir: str = Field(default="./generated_invoices", alias="INVOICE_OUTPUT_DIR")
     downloads_dir: str = Field(default="./downloads", alias="DOWNLOADS_DIR")
     softibridge_file_bridge_base: str = Field(default="", alias="SOFTIBRIDGE_FILE_BRIDGE_BASE")
+    # Multi-tenant: in prod il file-bridge è scritto dal sidecar sul VPS client, non dal backend.
+    # Default false (DB-only). Mettere true solo per dev locale single-tenant.
+    softibridge_bridge_file_legacy: bool = Field(default=False, alias="SOFTIBRIDGE_BRIDGE_FILE_LEGACY")
 
     billing_invoice_series: str = Field(default="A", alias="BILLING_INVOICE_SERIES")
     bank_account_name: str = Field(default="", alias="BANK_ACCOUNT_NAME")

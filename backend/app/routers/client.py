@@ -14,7 +14,7 @@ from app.db import get_db
 from app.deps import get_current_user
 import time
 
-from app.models import AuditLog, Client, Download, Invoice, License, ManualPaymentSubmission, Payment, Subscription, SignalRoom, User
+from app.models import AuditLog, Client, Download, Invoice, License, ManualPaymentSubmission, Payment, Plan, SignalRoom, Subscription, TelegramBot, User
 from app.schemas import (
     BillingPortalResponse,
     ClientDashboardResponse,
@@ -37,6 +37,16 @@ from app.services.stripe_service import create_billing_portal_session
 from app.services.bridge_files import enqueue_control_command, read_recent_events, read_recent_results, read_state_snapshot
 from app.services.licenses import issue_activation_code, normalize_license_status
 from app.services.download_access import is_download_allowed_for_client, resolve_allowed_download_codes
+from app.services.telegram_bots import (
+    BotApiError,
+    TokenEncryptionError,
+    build_webhook_url,
+    delete_webhook,
+    encrypt_token,
+    generate_webhook_secret,
+    set_webhook,
+    verify_token,
+)
 
 router = APIRouter(prefix="/client", tags=["client"])
 
@@ -68,6 +78,20 @@ class ManualUsdtSubmitRequest(BaseModel):
 
 class LicenseActivationCodeRequest(BaseModel):
     ttl_minutes: int = 20
+
+
+class TelegramBotRegisterRequest(BaseModel):
+    bot_token: str
+
+
+class TelegramBotOut(BaseModel):
+    id: str
+    bot_username: str | None = None
+    status: str
+    last_check_at: datetime | None = None
+    last_error: str | None = None
+    webhook_url: str | None = None
+    created_at: datetime | None = None
 
 
 def _resolve_client(db: Session, user: User) -> Client:
@@ -817,3 +841,168 @@ def client_onboarding_status(
             "expiry_at": lic.expiry_at.isoformat() if lic and lic.expiry_at else None,
         } if lic else None,
     }
+
+
+# ─────────────────────────────────────────────────────────────
+# BYO Telegram bot — il client porta il proprio bot
+# ─────────────────────────────────────────────────────────────
+
+_PLAN_BOT_LIMIT_DEFAULT = {"BASIC": 1, "PRO": 3, "ENTERPRISE": 10}
+
+
+def _bot_limit_for_client(db: Session, client: Client) -> int:
+    """Limite bot BYO per piano. Override via Plan.feature_flags.telegram_bots."""
+    lic = db.query(License).filter(License.client_id == client.id).order_by(License.created_at.desc()).first()
+    if not lic or not lic.plan_code:
+        return 1
+    plan = db.query(Plan).filter(Plan.code == lic.plan_code).one_or_none()
+    if plan and isinstance(plan.feature_flags, dict):
+        raw = plan.feature_flags.get("telegram_bots")
+        try:
+            if raw is not None:
+                return max(0, int(raw))
+        except (TypeError, ValueError):
+            pass
+    return _PLAN_BOT_LIMIT_DEFAULT.get(lic.plan_code.upper(), 1)
+
+
+def _bot_to_out(row: TelegramBot) -> TelegramBotOut:
+    return TelegramBotOut(
+        id=row.id,
+        bot_username=row.bot_username,
+        status=row.status,
+        last_check_at=row.last_check_at,
+        last_error=row.last_error,
+        webhook_url=row.webhook_url,
+        created_at=row.created_at,
+    )
+
+
+@router.get("/telegram-bot", response_model=list[TelegramBotOut])
+def list_telegram_bots(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    client = _resolve_client(db, user)
+    rows = (
+        db.query(TelegramBot)
+        .filter(TelegramBot.owner_type == "CLIENT", TelegramBot.owner_ref_id == client.id)
+        .filter(TelegramBot.status != "REVOKED")
+        .order_by(TelegramBot.created_at.desc())
+        .all()
+    )
+    return [_bot_to_out(r) for r in rows]
+
+
+@router.post("/telegram-bot", response_model=TelegramBotOut)
+def register_telegram_bot(
+    req: TelegramBotRegisterRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    client = _resolve_client(db, user)
+
+    # Enforce plan limit
+    limit = _bot_limit_for_client(db, client)
+    current = (
+        db.query(TelegramBot)
+        .filter(TelegramBot.owner_type == "CLIENT", TelegramBot.owner_ref_id == client.id)
+        .filter(TelegramBot.status == "ACTIVE")
+        .count()
+    )
+    if current >= limit:
+        raise HTTPException(status_code=403, detail=f"Limite bot del piano raggiunto ({limit})")
+
+    token = (req.bot_token or "").strip()
+    if not token or ":" not in token:
+        raise HTTPException(status_code=400, detail="Token bot non valido")
+
+    # Verify via getMe
+    try:
+        identity = verify_token(token)
+    except BotApiError as exc:
+        raise HTTPException(status_code=400, detail=f"Telegram getMe fallito: {exc}") from exc
+
+    # Encrypt + persist
+    try:
+        token_enc = encrypt_token(token)
+    except TokenEncryptionError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    bot_id = str(uuid.uuid4())
+    webhook_secret = generate_webhook_secret()
+    try:
+        webhook_url = build_webhook_url(bot_id)
+    except BotApiError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    row = TelegramBot(
+        id=bot_id,
+        owner_type="CLIENT",
+        owner_ref_id=client.id,
+        bot_username=identity.bot_username,
+        bot_token_enc=token_enc,
+        webhook_secret=webhook_secret,
+        webhook_url=webhook_url,
+        status="ACTIVE",
+        last_check_at=datetime.now(timezone.utc),
+    )
+    db.add(row)
+    db.flush()
+
+    # Registra webhook su Telegram
+    try:
+        set_webhook(token, webhook_url, webhook_secret)
+    except BotApiError as exc:
+        row.status = "SUSPENDED"
+        row.last_error = str(exc)[:500]
+        db.commit()
+        raise HTTPException(status_code=502, detail=f"setWebhook fallito: {exc}") from exc
+
+    db.add(AuditLog(
+        id=str(uuid.uuid4()),
+        actor_type="CLIENT",
+        actor_id=getattr(user, "id", None),
+        action="TELEGRAM_BOT_REGISTERED",
+        entity_type="TELEGRAM_BOT",
+        entity_id=bot_id,
+        details={"bot_username": identity.bot_username, "client_id": client.id},
+    ))
+    db.commit()
+    db.refresh(row)
+    return _bot_to_out(row)
+
+
+@router.delete("/telegram-bot/{bot_id}")
+def delete_telegram_bot(
+    bot_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    client = _resolve_client(db, user)
+    row = db.query(TelegramBot).filter(TelegramBot.id == bot_id).one_or_none()
+    if not row or row.owner_type != "CLIENT" or row.owner_ref_id != client.id:
+        raise HTTPException(status_code=404, detail="Bot non trovato")
+
+    # Best-effort deleteWebhook su Telegram
+    try:
+        from app.services.telegram_bots import decrypt_token as _dt
+        token = _dt(row.bot_token_enc)
+        delete_webhook(token)
+    except (BotApiError, TokenEncryptionError) as exc:
+        # Non blocco il soft-delete; logghiamo motivo
+        row.last_error = f"deleteWebhook: {exc}"[:500]
+
+    row.status = "REVOKED"
+    db.add(row)
+    db.add(AuditLog(
+        id=str(uuid.uuid4()),
+        actor_type="CLIENT",
+        actor_id=getattr(user, "id", None),
+        action="TELEGRAM_BOT_REVOKED",
+        entity_type="TELEGRAM_BOT",
+        entity_id=bot_id,
+        details={"bot_username": row.bot_username, "client_id": client.id},
+    ))
+    db.commit()
+    return {"ok": True, "bot_id": bot_id, "status": row.status}

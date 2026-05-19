@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import SessionLocal
-from app.models import AuditLog, Client, License, SignalFormat, SignalParseLog, SignalRoom
+from app.models import AuditLog, Client, License, SignalFormat, SignalParseLog, SignalRoom, TelegramBot
 from app.services.bridge_files import enqueue_command
 from app.services.bridge_queue import persist_command_for_licenses
 from app.services.ea_security import verify_ea_signature
@@ -223,22 +223,14 @@ def telegram_info():
     return {"get_me": me.data, "webhook_info": hook.data, "simulated": (me.simulated or hook.simulated)}
 
 
-@router.post("/webhook")
-async def telegram_webhook(
-    request: Request,
-    x_telegram_bot_api_secret_token: str | None = Header(default=None, alias="X-Telegram-Bot-Api-Secret-Token"),
-):
-    settings = get_settings()
-    if not settings.telegram_webhook_secret:
-        if not _is_dev_env():
-            raise HTTPException(
-                status_code=500,
-                detail="TELEGRAM_WEBHOOK_SECRET non configurato: webhook chiuso in produzione",
-            )
-    elif x_telegram_bot_api_secret_token != settings.telegram_webhook_secret:
-        raise HTTPException(status_code=403, detail="Telegram webhook secret non valido")
-
-    payload = await request.json()
+def _process_update(payload: dict, *, bot: TelegramBot | None) -> dict:
+    """
+    Logica condivisa: gestisce un update Telegram.
+    Se bot is None → modello C (bot globale): match SignalRoom dove telegram_bot_id IS NULL.
+                     Privato (/start, codice attivazione) abilitato.
+    Se bot is not None → modello B (BYO): match SignalRoom dove telegram_bot_id == bot.id.
+                          Privato disabilitato (lo gestisce solo il bot globale).
+    """
     chat_id = None
     text = None
     chat_type = None
@@ -267,8 +259,9 @@ async def telegram_webhook(
 
         # ─────────────────────────────────────────────────────
         # CASO 1: Messaggio PRIVATO con l'utente
+        # Solo bot di piattaforma (C). Bot BYO non gestisce attivazione.
         # ─────────────────────────────────────────────────────
-        if chat_id_s and text and chat_type == "private":
+        if bot is None and chat_id_s and text and chat_type == "private":
 
             # /start → saluto + richiesta codice licenza
             if text.strip() == "/start":
@@ -308,12 +301,18 @@ async def telegram_webhook(
         # salta enqueue ma non blocca audit del messaggio.
         signals_active = signals_enabled() and ea_bridge_enabled()
         if chat_id_s and text and chat_type in ("group", "supergroup", "channel"):
-            rooms = (
+            rooms_q = (
                 db.query(SignalRoom)
                 .filter(SignalRoom.active.is_(True))
                 .filter(SignalRoom.source_chat_id == chat_id_s)
-                .all()
             )
+            # Modello B (BYO): scope alle sole room legate a questo bot.
+            # Modello C (globale): scope alle room senza bot (telegram_bot_id IS NULL).
+            if bot is not None:
+                rooms_q = rooms_q.filter(SignalRoom.telegram_bot_id == bot.id)
+            else:
+                rooms_q = rooms_q.filter(SignalRoom.telegram_bot_id.is_(None))
+            rooms = rooms_q.all()
             for room in rooms:
                 policy = room.parser_policy or {}
                 if policy.get("auto_ingest_enabled", True) is False:
@@ -448,7 +447,50 @@ async def telegram_webhook(
     finally:
         db.close()
 
-    return {"ok": True, "chat_id": chat_id, "text": text, "signals": processed_signals}
+    return {"ok": True, "chat_id": chat_id, "text": text, "signals": processed_signals, "bot_id": (bot.id if bot else None)}
+
+
+@router.post("/webhook")
+async def telegram_webhook_global(
+    request: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None, alias="X-Telegram-Bot-Api-Secret-Token"),
+):
+    """Webhook bot globale di piattaforma (modello C)."""
+    settings = get_settings()
+    if not settings.telegram_webhook_secret:
+        if not _is_dev_env():
+            raise HTTPException(
+                status_code=500,
+                detail="TELEGRAM_WEBHOOK_SECRET non configurato: webhook chiuso in produzione",
+            )
+    elif x_telegram_bot_api_secret_token != settings.telegram_webhook_secret:
+        raise HTTPException(status_code=403, detail="Telegram webhook secret non valido")
+
+    payload = await request.json()
+    return _process_update(payload, bot=None)
+
+
+@router.post("/webhook/{bot_id}")
+async def telegram_webhook_byo(
+    bot_id: str,
+    request: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None, alias="X-Telegram-Bot-Api-Secret-Token"),
+):
+    """Webhook per bot BYO del client (modello B). bot_id identifica TelegramBot."""
+    db: Session = SessionLocal()
+    try:
+        bot = db.query(TelegramBot).filter(TelegramBot.id == bot_id).one_or_none()
+        if not bot or bot.status != "ACTIVE":
+            raise HTTPException(status_code=404, detail="Bot non attivo")
+        if not bot.webhook_secret:
+            raise HTTPException(status_code=500, detail="Bot senza webhook_secret")
+        if x_telegram_bot_api_secret_token != bot.webhook_secret:
+            raise HTTPException(status_code=403, detail="Bot webhook secret non valido")
+    finally:
+        db.close()
+
+    payload = await request.json()
+    return _process_update(payload, bot=bot)
 
 
 @router.post("/notify/trade-event")
