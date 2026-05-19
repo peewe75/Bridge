@@ -459,6 +459,37 @@ class SuperAdminPayout(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+class BridgeCommand(Base):
+    __tablename__ = "bridge_commands"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    license_id: Mapped[str] = mapped_column(String, ForeignKey("licenses.id"), index=True)
+    cmd_uid: Mapped[str] = mapped_column(String, unique=True, index=True)  # SIG-xxx / CTRL-xxx
+    platform: Mapped[str] = mapped_column(String, default="BOTH")  # MT4 / MT5 / BOTH
+    cmd_kind: Mapped[str] = mapped_column(String, default="SIGNAL")  # SIGNAL / CONTROL
+    payload_kv: Mapped[str] = mapped_column(Text)  # serialized k=v;... ready for EA/sidecar
+    status: Mapped[str] = mapped_column(String, default="PENDING", index=True)  # PENDING/CONSUMED/FAILED/EXPIRED
+    source_chat_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
+    room_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("signal_rooms.id"), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class BridgeResult(Base):
+    __tablename__ = "bridge_results"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    license_id: Mapped[str] = mapped_column(String, ForeignKey("licenses.id"), index=True)
+    cmd_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("bridge_commands.id"), nullable=True, index=True)
+    cmd_uid: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String)  # OK / ERROR
+    msg: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    ticket: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    extra: Mapped[dict] = mapped_column(JSON_COMPAT, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
 class VpsNode(Base):
     __tablename__ = "vps_nodes"
 

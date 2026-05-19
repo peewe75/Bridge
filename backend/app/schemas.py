@@ -210,6 +210,47 @@ class EaValidateResponse(BaseModel):
     expiry_at: datetime | None = None
 
 
+class EaCommandPullRequest(BaseModel):
+    license_id: str
+    install_id: str
+    account_number: str
+    platform: Literal["MT4", "MT5"]
+    timestamp: int
+    signature: str
+    since_id: int = 0
+    limit: int = Field(default=50, ge=1, le=500)
+
+
+class EaCommandItem(BaseModel):
+    id: int
+    cmd_uid: str
+    cmd_kind: str
+    platform: str
+    payload_kv: str
+    created_at: datetime | None = None
+
+
+class EaCommandPullResponse(BaseModel):
+    license_status: str | None = None
+    commands: list[EaCommandItem] = Field(default_factory=list)
+    server_ts: int
+
+
+class EaCommandAckRequest(BaseModel):
+    license_id: str
+    install_id: str
+    account_number: str
+    platform: Literal["MT4", "MT5"]
+    timestamp: int
+    signature: str
+    cmd_id: int | None = None
+    cmd_uid: str | None = None
+    status: Literal["OK", "ERROR"] = "OK"
+    msg: str | None = None
+    ticket: str | None = None
+    extra: dict[str, Any] = Field(default_factory=dict)
+
+
 class DownloadOut(BaseModel):
     id: str
     code: str
@@ -280,6 +321,9 @@ class SignalIngestRequest(BaseModel):
     require_valid_logic: bool = True
     write_mt4: bool = True
     write_mt5: bool = True
+    # Multi-tenant: licenze target per persistere su DB.
+    # Se vuoto, scrive solo file (back-compat). Telegram webhook risolve auto da room.
+    license_ids: list[str] = Field(default_factory=list)
 
 
 class SignalParseResult(BaseModel):

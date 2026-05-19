@@ -21,6 +21,7 @@ from app.schemas import (
     SignalRoomOut,
 )
 from app.services.bridge_files import enqueue_command
+from app.services.bridge_queue import persist_command_for_licenses
 from app.services.signal_parser import canonical_to_bridge_payload, parse_signal
 from app.services.system_control import ea_bridge_enabled, signals_enabled
 
@@ -167,9 +168,20 @@ def signal_ingest(req: SignalIngestRequest, user: User = Depends(require_roles("
     if should_enqueue and not (signals_enabled() and ea_bridge_enabled()):
         should_enqueue = False
         out.warnings.append("system_control_blocked")
+    db_cmd_rows: list = []
     if should_enqueue:
         payload = canonical_to_bridge_payload(out.canonical, source_chat_id=req.source_chat_id)
         enqueue_info = enqueue_command(payload, write_mt4=req.write_mt4, write_mt5=req.write_mt5)
+        db_cmd_rows = persist_command_for_licenses(
+            db,
+            license_ids=req.license_ids or [],
+            payload=payload,
+            cmd_kind="SIGNAL",
+            write_mt4=req.write_mt4,
+            write_mt5=req.write_mt5,
+            room_id=req.room_id,
+            source_chat_id=req.source_chat_id,
+        )
         db.add(AuditLog(
             id=str(uuid.uuid4()),
             actor_type="USER",
@@ -177,7 +189,12 @@ def signal_ingest(req: SignalIngestRequest, user: User = Depends(require_roles("
             action="SIGNAL_INGEST_ENQUEUED",
             entity_type="SIGNAL_PARSE_LOG",
             entity_id=log.id,
-            details={"confidence": out.confidence, "payload": payload},
+            details={
+                "confidence": out.confidence,
+                "payload": payload,
+                "db_cmd_ids": [r.id for r in db_cmd_rows],
+                "license_ids": req.license_ids or [],
+            },
             created_at=datetime.now(timezone.utc),
         ))
     else:
@@ -207,6 +224,7 @@ def signal_ingest(req: SignalIngestRequest, user: User = Depends(require_roles("
         },
         "enqueued": bool(enqueue_info),
         "enqueue": enqueue_info,
+        "db_cmd_ids": [r.id for r in db_cmd_rows],
     }
 
 

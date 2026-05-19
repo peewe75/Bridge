@@ -10,6 +10,7 @@ from app.config import get_settings
 from app.db import SessionLocal
 from app.models import AuditLog, Client, License, SignalFormat, SignalParseLog, SignalRoom
 from app.services.bridge_files import enqueue_command
+from app.services.bridge_queue import persist_command_for_licenses
 from app.services.ea_security import verify_ea_signature
 from app.services.licenses import hash_activation_code, is_license_runtime_valid, normalize_license_status
 from app.services.signal_parser import canonical_to_bridge_payload, parse_signal
@@ -357,6 +358,7 @@ async def telegram_webhook(
                     # H11: enqueue solo se almeno un client ha licenza runtime-valid
                     now_dt = datetime.now(timezone.utc)
                     valid_clients: list[Client] = []
+                    valid_license_ids: list[str] = []
                     for cl in clients_in_room:
                         lic = (
                             db.query(License)
@@ -369,14 +371,28 @@ async def telegram_webhook(
                         ok, _ = is_license_runtime_valid(lic, now=now_dt)
                         if ok:
                             valid_clients.append(cl)
+                            valid_license_ids.append(lic.id)
 
                     if not valid_clients:
                         should_enqueue = False
                         parsed.warnings.append("no_valid_license_in_room")
 
+                db_cmd_rows: list = []
                 if should_enqueue:
                     bridge_payload = canonical_to_bridge_payload(parsed.canonical, source_chat_id=chat_id_s)
+                    # File legacy (back-compat dev/single-tenant)
                     enqueue_meta = enqueue_command(bridge_payload, write_mt4=write_mt4, write_mt5=write_mt5)
+                    # DB per-license (multi-tenant, sidecar polls /api/ea/commands/pull)
+                    db_cmd_rows = persist_command_for_licenses(
+                        db,
+                        license_ids=valid_license_ids,
+                        payload=bridge_payload,
+                        cmd_kind="SIGNAL",
+                        write_mt4=write_mt4,
+                        write_mt5=write_mt5,
+                        room_id=room.id,
+                        source_chat_id=chat_id_s,
+                    )
 
                     for cl in valid_clients:
                         _send_order_notification(cl, parsed.canonical, event_type="OPENED")
@@ -394,6 +410,8 @@ async def telegram_webhook(
                             "parser_used": parsed.parser_used,
                             "payload": bridge_payload,
                             "notified_clients": len(valid_clients),
+                            "db_cmd_ids": [r.id for r in db_cmd_rows],
+                            "db_cmd_count": len(db_cmd_rows),
                         },
                         created_at=datetime.now(timezone.utc),
                     ))

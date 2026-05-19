@@ -1,0 +1,12 @@
+{
+  "api_base": "https://api.softibridge.example.com",
+  "license_id": "SB-XXXXXXXX",
+  "install_id": "vps-mt4-001-uuid",
+  "account_number": "12345678",
+  "platform": "MT4",
+  "ea_hmac_secret": "REPLACE_WITH_BACKEND_EA_HMAC_SECRET",
+  "bridge_files_dir": "C:\\Users\\<utente>\\AppData\\Roaming\\MetaQuotes\\Terminal\\<istanza>\\MQL4\\Files\\SoftiBridge",
+  "poll_interval_sec": 2.0,
+  "pull_limit": 50,
+  "http_timeout_sec": 10
+}

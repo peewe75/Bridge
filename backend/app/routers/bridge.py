@@ -23,6 +23,7 @@ from app.services.bridge_files import (
     read_recent_results,
     write_result_file,
 )
+from app.services.bridge_queue import persist_command_for_licenses
 from app.services.system_control import ea_bridge_enabled
 
 
@@ -67,6 +68,9 @@ class BridgeCommandRequest(BaseModel):
     tp3: int | None = None
     write_mt4: bool = True
     write_mt5: bool = True
+    # Multi-tenant: opzionale, persiste comando anche in DB per le licenze target.
+    # Se vuoto, scrive solo su file (back-compat single-tenant).
+    license_ids: list[str] = []
 
 
 class BridgeSimEventRequest(BaseModel):
@@ -106,6 +110,7 @@ class BridgeControlRequest(BaseModel):
     move_sl_pips: int | None = None
     write_mt4: bool = True
     write_mt5: bool = True
+    license_ids: list[str] = []
 
 
 @router.get("/status")
@@ -175,17 +180,30 @@ def bridge_enqueue(
             "tp1": req.tp1, "tp2": req.tp2, "tp3": req.tp3 or req.tp2, "open": req.open or 0,
         })
     out = enqueue_command(payload, write_mt4=req.write_mt4, write_mt5=req.write_mt5)
+    db_rows = persist_command_for_licenses(
+        db,
+        license_ids=req.license_ids or [],
+        payload=payload,
+        cmd_kind="SIGNAL",
+        write_mt4=req.write_mt4,
+        write_mt5=req.write_mt5,
+    )
     db.add(AuditLog(
         id=str(uuid.uuid4()),
         actor_type="ADMIN",
         action="BRIDGE_COMMAND_ENQUEUED",
         entity_type="EA_QUEUE",
         entity_id=payload["id"],
-        details={"payload": payload, "queues": out},
+        details={
+            "payload": payload,
+            "queues": out,
+            "db_cmd_ids": [r.id for r in db_rows],
+            "license_ids": req.license_ids or [],
+        },
         created_at=datetime.now(timezone.utc),
     ))
     db.commit()
-    return {"ok": True, "id": payload["id"], **out}
+    return {"ok": True, "id": payload["id"], "db_cmd_ids": [r.id for r in db_rows], **out}
 
 
 @router.post("/control")
@@ -214,6 +232,31 @@ def bridge_control(
         write_mt4=req.write_mt4,
         write_mt5=req.write_mt5,
     )
+    # Per CONTROL su DB serve ricostruire il payload (enqueue_control_command non lo ritorna)
+    ctrl_payload: dict[str, Any] = {
+        "mode": "CTRL",
+        "action": action,
+        "symbol": req.symbol or "CURRENT",
+        "comment": "SoftiBridge-Web",
+    }
+    if side_filter:
+        ctrl_payload["filter"] = side_filter
+    if req.ticket is not None:
+        ctrl_payload["ticket"] = int(req.ticket)
+    if req.sl_price is not None:
+        ctrl_payload["sl_price"] = req.sl_price
+    if req.tp_price is not None:
+        ctrl_payload["tp_price"] = req.tp_price
+    if req.move_sl_pips is not None:
+        ctrl_payload["move_sl_pips"] = int(req.move_sl_pips)
+    db_rows = persist_command_for_licenses(
+        db,
+        license_ids=req.license_ids or [],
+        payload=ctrl_payload,
+        cmd_kind="CONTROL",
+        write_mt4=req.write_mt4,
+        write_mt5=req.write_mt5,
+    )
     db.add(AuditLog(
         id=str(uuid.uuid4()),
         actor_type="USER",
@@ -221,11 +264,16 @@ def bridge_control(
         action="BRIDGE_CONTROL_ENQUEUED",
         entity_type="EA_QUEUE",
         entity_id=None,
-        details={"request": req.model_dump(), "queues": out},
+        details={
+            "request": req.model_dump(),
+            "queues": out,
+            "db_cmd_ids": [r.id for r in db_rows],
+            "license_ids": req.license_ids or [],
+        },
         created_at=datetime.now(timezone.utc),
     ))
     db.commit()
-    return {"ok": True, **out}
+    return {"ok": True, "db_cmd_ids": [r.id for r in db_rows], **out}
 
 
 @router.post("/simulate/event")
